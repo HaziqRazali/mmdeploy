@@ -148,7 +148,7 @@ def main():
     # optionally use OKS for keypoints similarity comparison
     sigmas = VISUALIZATION_CFG[args.skeleton]['sigmas']
     state = tracker.create_state(
-        det_interval=1, det_min_bbox_size=100, keypoint_sigmas=sigmas)
+        det_interval=10, det_min_bbox_size=100, keypoint_sigmas=sigmas)
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
