@@ -28,20 +28,21 @@ def load_hydra_cfg(config_path, config_name, overrides):
         cfg = compose(config_name=config_name, overrides=overrides)
     return cfg
 
-def normalize_kpts_bbox(kpts_xy, bbox_xyxy):
-    
-    x1, y1, x2, y2 = bbox_xyxy
+def _ms(x):  # seconds -> milliseconds
+    return 1000.0 * x
+
+def normalize_kpts_bbox_inplace(kpts_xy_f32, bbox_xyxy_f32):
+    x1, y1, x2, y2 = bbox_xyxy_f32
     w = max(x2 - x1, 1.0)
     h = max(y2 - y1, 1.0)
-    out = kpts_xy.astype(np.float32).copy()
-    out[:, 0] = (out[:, 0] - x1) / w
-    out[:, 1] = (out[:, 1] - y1) / h
-    return out
+    kpts_xy_f32[:, 0] = (kpts_xy_f32[:, 0] - x1) / w
+    kpts_xy_f32[:, 1] = (kpts_xy_f32[:, 1] - y1) / h
+    return kpts_xy_f32
 
 def build_kpts2smpl_model(cfg, weights_path, device="cpu"):
     import importlib
-
     module = importlib.import_module(cfg.architecture.module_path)
+
     net = module.model(cfg).to(device)
     net.eval()
 
@@ -52,7 +53,7 @@ def build_kpts2smpl_model(cfg, weights_path, device="cpu"):
     elif isinstance(ckpt, dict) and "state_dict" in ckpt:
         state = ckpt["state_dict"]
     else:
-        state = ckpt  # raw state_dict
+        state = ckpt
 
     missing, unexpected = net.load_state_dict(state, strict=False)
     print(f"[WEIGHTS] loaded {weights_path}")
@@ -262,7 +263,8 @@ def main():
     input_key   = "kpts_normalized_filtered"
 
     # build net
-    net = build_kpts2smpl_model(cfg, args.weights)
+    net = build_kpts2smpl_model(cfg, args.weights).float()
+    mask = torch.ones((1, 22, 1), device="cpu", dtype=torch.float32)
 
     # initialize smpl
     smplx_helper = SMPLXHelper(os.path.expanduser('~/datasets/mocap/data/models_smplx_v1_1/models/'))
@@ -274,14 +276,40 @@ def main():
 
     t_start = time.time()
     frame_id = 0
+
+    prof_sum = {
+        "read_frame": 0.0,
+        "pose2d": 0.0,
+        "preprocess_2d": 0.0,
+        "mlp_forward": 0.0,
+        "smpl_convert": 0.0,
+        "smpl_render": 0.0,
+        "total_frame": 0.0,
+    }
+    prof_n = 0
+
+    GLOBAL_ORIENT = torch.tensor([
+                [1., 0.,  0.],
+                [0., 0., -1.],
+                [0., 1.,  0.]
+                ], device="cpu")[None, None]
+
     while True:
+        t_total0 = time.perf_counter()
+
+        t0 = time.perf_counter()
         success, frame = video.read()
-        frame = cv2.resize(frame, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_LINEAR)
-        if not success:
+        if not success or frame is None:
             break
+        frame = cv2.resize(frame, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_LINEAR)
+        t1 = time.perf_counter()
+        prof_sum["read_frame"] += (t1 - t0)
 
         ##### get 2d pose
+        t0 = time.perf_counter()
         results = tracker(state, frame, detect=-1)
+        t1 = time.perf_counter()
+        prof_sum["pose2d"] += (t1 - t0)
 
         ##### visualize 2d pose
         if args.save_2d or args.show_2d:
@@ -296,6 +324,8 @@ def main():
 
         ##### get 3d pose
         if args.pred_3d:
+
+            t0 = time.perf_counter()
             keypoints, bboxes, _ = results
 
             if keypoints is None or len(keypoints) == 0:
@@ -303,35 +333,38 @@ def main():
                 continue
 
             # normalize kpts
-            kpts    = keypoints[0, :, :2].astype(np.float32)        # [k, 2]
-            bbox    = bboxes[0].astype(np.float32)                  # [4]
-            kpts    = normalize_kpts_bbox(kpts, bbox)               # [k, 2]
+            kpts = keypoints[0, :, :2].astype(np.float32, copy=False)
+            bbox = bboxes[0].astype(np.float32, copy=False)
+            normalize_kpts_bbox_inplace(kpts, bbox)
 
             # retrieve relevant kpts
             kpts    = kpts[relevant_joint_idxs]                     # [k', 2]
-            scores  = keypoints[0, :, 2].astype(np.float32)         # [k]
-            scores  = scores[relevant_joint_idxs]                   # [k']
-            kpts[scores < 0.1, :] = 0.0                             # [k']
-            kpts    = torch.from_numpy(kpts).unsqueeze(0).to("cpu") # [k']
+            scores  = keypoints[0, relevant_joint_idxs, 2].astype(np.float32, copy=False)
+            kpts[scores < 0.1] = 0.0
+            kpts    = torch.from_numpy(kpts).unsqueeze(0)           # [k']
 
             # mask placeholder input
-            mask = torch.ones((1, 22, 1), device="cpu", dtype=kpts.dtype)
+            t1 = time.perf_counter()
+            prof_sum["preprocess_2d"] += (t1 - t0)
                 
             # forward pass
-            out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
             pred_smpl = out["pred_smpl"][0]  # [22,6]
+            t1 = time.perf_counter()
+            prof_sum["mlp_forward"] += (t1 - t0)
 
+            t0 = time.perf_counter()
             #global_orient   = pred_smpl[0:1]                    # [1,  6]
             #global_orient   = rot6d_to_matrix(global_orient)    # [1,  3, 3]
             #global_orient   = global_orient[None]               # [1, 1,  3, 3]
-            global_orient = torch.tensor([
-                            [1., 0.,  0.],
-                            [0., 0., -1.],
-                            [0., 1.,  0.]
-                            ], device="cpu")[None, None]
+            global_orient = GLOBAL_ORIENT
             body_pose = pred_smpl[1:]                     # [21, 6]
             body_pose = rot6d_to_matrix(body_pose)        # [21, 3, 3]
             body_pose = body_pose[None]                   # [1, 21, 3, 3]
+            t1 = time.perf_counter()
+            prof_sum["smpl_convert"] += (t1 - t0)
 
             #################### form smplx model
             if args.show_3d:
@@ -359,11 +392,32 @@ def main():
                 cv2.imshow('smplx', image)
                 cv2.waitKey(1)
 
+        prof_sum["total_frame"] += (time.perf_counter() - t_total0)
+        prof_n += 1
         frame_id += 1
+
         if frame_id % 30 == 0:
             elapsed = time.time() - t_start
             fps = frame_id / elapsed
             print(f"[FPS] {fps:.2f} ({frame_id} frames)")
+
+            # averages over the *current profiling window* (prof_n frames)
+            denom = max(prof_n, 1)
+            print(
+                "[TIMING ms/frame] "
+                f"read={_ms(prof_sum['read_frame']/denom):.2f} | "
+                f"pose2d={_ms(prof_sum['pose2d']/denom):.2f} | "
+                f"prep={_ms(prof_sum['preprocess_2d']/denom):.2f} | "
+                f"mlp={_ms(prof_sum['mlp_forward']/denom):.2f} | "
+                f"smpl={_ms(prof_sum['smpl_convert']/denom):.2f} | "
+                f"render={_ms(prof_sum['smpl_render']/denom):.2f} | "
+                f"total={_ms(prof_sum['total_frame']/denom):.2f}"
+            )
+
+            # reset window so each print is for the last ~30 frames
+            for k in prof_sum:
+                prof_sum[k] = 0.0
+            prof_n = 0
 
 if __name__ == '__main__':
     main()
