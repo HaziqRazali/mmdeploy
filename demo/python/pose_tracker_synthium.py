@@ -17,10 +17,26 @@ from fit3d_variables import coco_wholebody
 sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/imar_vision_datasets_tools/'))
 from util.smplx_util import SMPLXHelper
 
+sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/imar_vision_datasets_tools/util'))
+from dataset_util import rot6d_to_matrix
+
+sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/'))
+from utils_draw import render_simple_pyrender
+
 def load_hydra_cfg(config_path, config_name, overrides):
     with initialize_config_dir(config_dir=config_path, version_base=None):
         cfg = compose(config_name=config_name, overrides=overrides)
     return cfg
+
+def normalize_kpts_bbox(kpts_xy, bbox_xyxy):
+    
+    x1, y1, x2, y2 = bbox_xyxy
+    w = max(x2 - x1, 1.0)
+    h = max(y2 - y1, 1.0)
+    out = kpts_xy.astype(np.float32).copy()
+    out[:, 0] = (out[:, 0] - x1) / w
+    out[:, 1] = (out[:, 1] - y1) / h
+    return out
 
 def build_kpts2smpl_model(cfg, weights_path, device="cpu"):
     import importlib
@@ -52,12 +68,11 @@ def parse_args():
     parser.add_argument('det_model', help='path of mmdeploy SDK model dumped by model converter')
     parser.add_argument('pose_model', help='path of mmdeploy SDK model dumped by model converter')
     parser.add_argument('video', help='video path or camera index')
-    parser.add_argument('--output_dir', help='output directory', default=None)
-    parser.add_argument(
-        '--skeleton',
-        default='coco',
-        choices=['coco', 'coco_wholebody', 'coco_wholebody_truncated_hand'],
-        help='skeleton for keypoints')
+    parser.add_argument("--save-2d", type=str, default=None, help="Path to save visualization (directory or video)")
+    parser.add_argument("--show-2d", type=int, default=0, help="Show visualization window")
+    parser.add_argument("--pred-3d", type=int, default=1)
+    parser.add_argument("--show-3d", type=int, default=0, help="Show visualization window")
+    parser.add_argument('--skeleton', default='coco', choices=['coco', 'coco_wholebody', 'coco_wholebody_truncated_hand'], help='skeleton for keypoints')
 
     ##### 2D to 3D model arguments    
     parser.add_argument("--config-path", required=True)
@@ -172,15 +187,17 @@ VISUALIZATION_CFG["coco_wholebody_truncated_hand"] = dict(
 
 def visualize(frame,
               results,
-              output_dir,
               frame_id,
+              skeleton_type='coco',
+              save_vis=None,
+              show_vis=False,
               thr=0.5,
-              resize=1280,
-              skeleton_type='coco'):
+              resize=400,
+              ):
 
-    skeleton = VISUALIZATION_CFG[skeleton_type]['skeleton']
-    palette = VISUALIZATION_CFG[skeleton_type]['palette']
-    link_color = VISUALIZATION_CFG[skeleton_type]['link_color']
+    skeleton    = VISUALIZATION_CFG[skeleton_type]['skeleton']
+    palette     = VISUALIZATION_CFG[skeleton_type]['palette']
+    link_color  = VISUALIZATION_CFG[skeleton_type]['link_color']
     point_color = VISUALIZATION_CFG[skeleton_type]['point_color']
 
     scale = resize / max(frame.shape[0], frame.shape[1])
@@ -208,11 +225,18 @@ def visualize(frame,
         for kpt, show, color in zip(kpts, show, point_color):
             if show:
                 cv2.circle(img, kpt, 1, palette[color], 2, cv2.LINE_AA)
-    if output_dir:
-        cv2.imwrite(f'{output_dir}/{str(frame_id).zfill(6)}.jpg', img)
-    else:
-        cv2.imshow('pose_tracker', img)
-        return cv2.waitKey(1) != 'q'
+
+    if save_vis is not None:
+        os.makedirs(save_vis, exist_ok=True)
+        cv2.imwrite(
+            os.path.join(save_vis, f"{frame_id:06d}.jpg"),
+            img
+        )
+
+    if show_vis:
+        cv2.imshow("pose_tracker", img)
+        return cv2.waitKey(1) != ord('q')
+
     return True
 
 
@@ -229,24 +253,30 @@ def main():
 
     # optionally use OKS for keypoints similarity comparison
     sigmas  = VISUALIZATION_CFG[args.skeleton]['sigmas']
-    state   = tracker.create_state(det_interval=10, det_min_bbox_size=100, keypoint_sigmas=sigmas)
-
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
+    state   = tracker.create_state(det_interval=15, det_min_bbox_size=50, keypoint_sigmas=sigmas)
 
     ##### initialize 2D to 3D model
-    cfg = load_hydra_cfg(args.config_path, args.config_name, args.override)
-    input_key = cfg.params.kpts2smpl.input  # "kpts_normalized_filtered"
+
+    # configs
+    cfg         = load_hydra_cfg(args.config_path, args.config_name, args.override)
+    input_key   = "kpts_normalized_filtered"
+
+    # build net
     net = build_kpts2smpl_model(cfg, args.weights)
+
+    # initialize smpl
     smplx_helper = SMPLXHelper(os.path.expanduser('~/datasets/mocap/data/models_smplx_v1_1/models/'))
     smplx_helper.smplx_model = smplx_helper.smplx_model.to("cpu")
     faces       = smplx_helper.smplx_model.faces
     faces       = np.asarray(faces)    
     
+    ##### begin 
+
     t_start = time.time()
     frame_id = 0
     while True:
         success, frame = video.read()
+        frame = cv2.resize(frame, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_LINEAR)
         if not success:
             break
 
@@ -254,33 +284,86 @@ def main():
         results = tracker(state, frame, detect=-1)
 
         ##### visualize 2d pose
-        if not visualize(
-                frame,
-                results,
-                args.output_dir,
-                frame_id,
-                skeleton_type=args.skeleton):
-            break
+        if args.save_2d or args.show_2d:
+            if not visualize(
+                    frame,
+                    results,
+                    frame_id,
+                    skeleton_type=args.skeleton,
+                    save_vis=args.save_2d,
+                    show_vis=args.show_2d):
+                break
 
         ##### get 3d pose
-        keypoints, bboxes, _ = results
+        if args.pred_3d:
+            keypoints, bboxes, _ = results
 
-        if keypoints is None or len(keypoints) == 0:
-            frame_id += 1
-            continue
+            if keypoints is None or len(keypoints) == 0:
+                frame_id += 1
+                continue
 
-        kpts    = keypoints[0, :, :2].astype(np.float32)    # [k, 2]
-        kpts    = kpts[relevant_joint_idxs]                 # [k', 2]
-        scores  = keypoints[0, :, 2].astype(np.float32)     # [k]
-        scores  = scores[relevant_joint_idxs]               # [k']
-        bbox    = bboxes[0].astype(np.float32)              # [4]
-            
+            # normalize kpts
+            kpts    = keypoints[0, :, :2].astype(np.float32)        # [k, 2]
+            bbox    = bboxes[0].astype(np.float32)                  # [4]
+            kpts    = normalize_kpts_bbox(kpts, bbox)               # [k, 2]
+
+            # retrieve relevant kpts
+            kpts    = kpts[relevant_joint_idxs]                     # [k', 2]
+            scores  = keypoints[0, :, 2].astype(np.float32)         # [k]
+            scores  = scores[relevant_joint_idxs]                   # [k']
+            kpts[scores < 0.1, :] = 0.0                             # [k']
+            kpts    = torch.from_numpy(kpts).unsqueeze(0).to("cpu") # [k']
+
+            # mask placeholder input
+            mask = torch.ones((1, 22, 1), device="cpu", dtype=kpts.dtype)
+                
+            # forward pass
+            out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
+            pred_smpl = out["pred_smpl"][0]  # [22,6]
+
+            #global_orient   = pred_smpl[0:1]                    # [1,  6]
+            #global_orient   = rot6d_to_matrix(global_orient)    # [1,  3, 3]
+            #global_orient   = global_orient[None]               # [1, 1,  3, 3]
+            global_orient = torch.tensor([
+                            [1., 0.,  0.],
+                            [0., 0., -1.],
+                            [0., 1.,  0.]
+                            ], device="cpu")[None, None]
+            body_pose = pred_smpl[1:]                     # [21, 6]
+            body_pose = rot6d_to_matrix(body_pose)        # [21, 3, 3]
+            body_pose = body_pose[None]                   # [1, 21, 3, 3]
+
+            #################### form smplx model
+            if args.show_3d:
+                world_smplx_params = {
+                    "transl": torch.zeros((1, 3), device="cpu", dtype=torch.float32),
+                    "global_orient": global_orient.to(device="cpu", dtype=torch.float32),
+                    "body_pose": body_pose.to(device="cpu", dtype=torch.float32),
+                }
+                world_posed_data    = smplx_helper.smplx_model(**world_smplx_params)
+                vertices            = world_posed_data.vertices[0]   # [10475, 3]
+                vertices            = vertices.detach().cpu().numpy()
+
+                _, _, image = render_simple_pyrender(
+                    vertices,
+                    faces,
+                    "temp.png",
+                    img_width=800,
+                    img_height=800,
+                    ref_center=None,
+                    ref_radius=None,
+                    center_offset=(0.0, 0.0, 0.0),
+                    label="TRUE",
+                    save=False,
+                )
+                cv2.imshow('smplx', image)
+                cv2.waitKey(1)
+
         frame_id += 1
         if frame_id % 30 == 0:
             elapsed = time.time() - t_start
             fps = frame_id / elapsed
             print(f"[FPS] {fps:.2f} ({frame_id} frames)")
-
 
 if __name__ == '__main__':
     main()
