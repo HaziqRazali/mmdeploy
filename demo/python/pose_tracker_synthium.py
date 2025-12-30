@@ -7,7 +7,7 @@ import torch
 
 import cv2
 import numpy as np
-#import open3d as o3d
+import open3d as o3d
 
 from mmdeploy_runtime import PoseTracker
 from hydra import initialize_config_dir, compose
@@ -25,7 +25,7 @@ from dataset_util import rot6d_to_matrix
 sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/'))
 from utils_draw import render_simple_pyrender
 
-"""
+#"""
 class StickFigureO3D:
     def __init__(self, edges, window_name="SMPL Stick", width=800, height=800):
         self.edges = np.asarray(edges, dtype=np.int32)
@@ -69,7 +69,7 @@ class StickFigureO3D:
 
     def close(self):
         self.vis.destroy_window()
-"""
+#"""
 
 def load_hydra_cfg(config_path, config_name, overrides):
     with initialize_config_dir(config_dir=config_path, version_base=None):
@@ -139,7 +139,8 @@ def parse_args():
     parser.add_argument("--save-2d", type=str, default=None, help="Path to save visualization (directory or video)")
     parser.add_argument("--show-2d", type=int, default=0, help="Show visualization window")
     parser.add_argument("--pred-3d", type=int, default=1)
-    parser.add_argument("--show-3d", type=int, default=0, help="Show visualization window")
+    parser.add_argument("--show-3d-skel", type=int, default=0, help="Show skel visualization window")
+    parser.add_argument("--show-3d-mesh", type=int, default=0, help="Show mesh window")
     parser.add_argument('--skeleton', default='coco', choices=['coco', 'coco_wholebody', 'coco_wholebody_truncated_hand'], help='skeleton for keypoints')
 
     ##### 2D to 3D model arguments    
@@ -338,24 +339,45 @@ def main():
     smplx_helper.smplx_model = smplx_helper.smplx_model.to("cpu")
     faces       = smplx_helper.smplx_model.faces
     faces       = np.asarray(faces)    
+
+    """
+    N = 22
+    parents_full = smplx_helper.smplx_model.parents.detach().cpu().numpy().astype(int)
+    print("parents_full.shape:", parents_full.shape)
+
+    parents22 = parents_full[:N]
+    print("parents22:", parents22.tolist())
+    print("parents22 max:", parents22.max(), "min:", parents22.min())
+
+    bad = np.where(parents22 >= N)[0]
+    print("bad idx (parents>=N):", bad.tolist())
+    if len(bad) > 0:
+        print("bad parents values:", parents22[bad].tolist())
+    sys.exit()
+    """
     
     # grab rest joints
     with torch.inference_mode():
-        zero = torch.zeros((1, 3), dtype=torch.float32)
-        zeros_body = torch.zeros((1, 21, 3, 3), dtype=torch.float32)
+        I = torch.eye(3, dtype=torch.float32)
 
-        # NOTE: depends on your SMPLX library API; adjust if needed
+        # identity rotations for rest pose
+        global_orient_rest = I[None, None]                  # (1,1,3,3) matches your later usage
+        body_pose_rest     = I[None, None].repeat(1, 21, 1, 1)  # (1,21,3,3)
+
         out0 = smplx_helper.smplx_model(
-            transl=torch.zeros((1, 3)),
-            global_orient=torch.eye(3)[None, None],
-            body_pose=zeros_body,
+            transl=torch.zeros((1, 3), dtype=torch.float32),
+            global_orient=global_orient_rest,
+            body_pose=body_pose_rest,
+            pose2rot=False,   # IMPORTANT when providing rotmats
         )
-        J_rest = out0.joints[0].detach().cpu().numpy()[:22].astype(np.float32) # [22, 3]
-        parents = smplx_helper.smplx_model.parents[:22].detach().cpu().numpy().astype(np.int32) # [22]
 
+        J_rest = out0.joints[0].detach().cpu().numpy()[:22].astype(np.float32)
+        parents = smplx_helper.smplx_model.parents[:22].detach().cpu().numpy().astype(np.int32)
+
+        # offsets
         J_OFF = np.zeros_like(J_rest, dtype=np.float32)
         for j in range(22):
-            p = parents[j]
+            p = int(parents[j])
             if p == -1:
                 J_OFF[j] = J_rest[j]
             else:
@@ -363,9 +385,8 @@ def main():
 
         edges = [(int(p), j) for j, p in enumerate(parents) if int(p) != -1]
         stick_vis = None
-        #if args.show_3d:
-        #    stick_vis = StickFigureO3D(edges, window_name="SMPL Stick", width=800, height=800)
-
+        if args.show_3d_skel:
+            stick_vis = StickFigureO3D(edges, window_name="SMPL Stick", width=800, height=800)
 
     ##### begin 
 
@@ -465,21 +486,23 @@ def main():
             prof_sum["smpl_convert"] += (t1 - t0)
 
             #################### form smplx model
-            if args.show_3d:
+            if args.show_3d_skel:
 
-                # t0 = time.perf_counter()
-                # R_root = global_orient[0, 0].detach().cpu().numpy().astype(np.float32)  # (3,3)
-                # R_body = body_pose[0].detach().cpu().numpy().astype(np.float32)         # (21,3,3)
+                t0 = time.perf_counter()
+                R_root = global_orient[0, 0].detach().cpu().numpy().astype(np.float32)  # (3,3)
+                R_body = body_pose[0].detach().cpu().numpy().astype(np.float32)         # (21,3,3)
 
-                # R       = np.zeros((22, 3, 3), dtype=np.float32)
-                # R[0]    = R_root
-                # R[1:]   = R_body
-                # J_pos = fk_joints_from_offsets(R, parents, J_OFF)
-                # t1 = time.perf_counter()
-                # prof_sum["smpl_forward_pass"] += (t1 - t0)
+                R       = np.zeros((22, 3, 3), dtype=np.float32)
+                R[0]    = R_root
+                R[1:]   = R_body
+                J_pos = fk_joints_from_offsets(R, parents, J_OFF)
+                t1 = time.perf_counter()
+                prof_sum["smpl_forward_pass"] += (t1 - t0)
 
-                # if stick_vis is not None:
-                #     stick_vis.update(J_pos)
+                if stick_vis is not None:
+                    stick_vis.update(J_pos)
+
+            if args.show_3d_mesh:
                 
                 t0 = time.perf_counter()
                 world_smplx_params = {
@@ -493,8 +516,6 @@ def main():
                 vertices            = vertices.detach().cpu().numpy()
                 t1 = time.perf_counter()
                 prof_sum["smpl_forward_pass"] += (t1 - t0)
-                #print(world_posed_data.joints.shape)
-                #sys.exit()
 
                 t0 = time.perf_counter()
                 ref_center, ref_radius, image = render_simple_pyrender(

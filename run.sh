@@ -10,7 +10,7 @@ $HOME/datasets/mocap/data/fit3d/train/s07/videos/60457274/dumbbell_biceps_curls.
 --override "run_name=fit3d_mmposelarge_mlp_lr1e-3_thr0_kptsmask0" \
 --override "optimization.batch_size=1" \
 --weights "~/Collab_AI/weights/synthium/kpts2smpl/trainedonall_mmposesmall_mlp_lr1e-3_thr0_kptsmask0_orient0/all_epoch_0308_best_0308_state_dict.pt" \
---show-2d 0 --pred-3d 1 --show-3d 0
+--show-2d 0 --pred-3d 1 --show-3d-mesh 1
 
 python pose_tracker.py cpu \
 $HOME/mmdeploy/rtmpose-ort/rtmdet-nano/ \
