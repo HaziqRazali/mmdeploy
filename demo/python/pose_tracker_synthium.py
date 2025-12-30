@@ -128,6 +128,154 @@ def fk_joints_from_offsets(R, parents, J_OFF):
             T[j] = T[p] @ M
     return T[:, :3, 3]
 
+def rotmat_to_quat(R: torch.Tensor) -> torch.Tensor:
+    """
+    R: (..., 3, 3) rotation matrices
+    returns q: (..., 4) as (w, x, y, z), normalized
+    """
+    # Based on standard robust conversion
+    r00 = R[..., 0, 0]
+    r11 = R[..., 1, 1]
+    r22 = R[..., 2, 2]
+
+    qw = torch.sqrt(torch.clamp(1.0 + r00 + r11 + r22, min=0.0)) * 0.5
+    qx = torch.sqrt(torch.clamp(1.0 + r00 - r11 - r22, min=0.0)) * 0.5
+    qy = torch.sqrt(torch.clamp(1.0 - r00 + r11 - r22, min=0.0)) * 0.5
+    qz = torch.sqrt(torch.clamp(1.0 - r00 - r11 + r22, min=0.0)) * 0.5
+
+    # Pick signs using off-diagonal terms
+    qx = torch.copysign(qx, R[..., 2, 1] - R[..., 1, 2])
+    qy = torch.copysign(qy, R[..., 0, 2] - R[..., 2, 0])
+    qz = torch.copysign(qz, R[..., 1, 0] - R[..., 0, 1])
+
+    q = torch.stack([qw, qx, qy, qz], dim=-1)
+    q = q / (q.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+    return q
+
+
+def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """
+    q: (..., 4) as (w, x, y, z), assumed normalized
+    returns R: (..., 3, 3)
+    """
+    q = q / (q.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+    w, x, y, z = q.unbind(dim=-1)
+
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+
+    R = torch.stack(
+        [
+            ww + xx - yy - zz, 2 * (xy - wz),       2 * (xz + wy),
+            2 * (xy + wz),       ww - xx + yy - zz, 2 * (yz - wx),
+            2 * (xz - wy),       2 * (yz + wx),     ww - xx - yy + zz,
+        ],
+        dim=-1,
+    ).reshape(q.shape[:-1] + (3, 3))
+    return R
+
+
+def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    """
+    q0, q1: (..., 4) (w,x,y,z), normalized
+    t: scalar in [0,1]
+    """
+    # Ensure shortest path (sign-fix)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0.0, -q1, q1)
+    dot = dot.abs()
+
+    # If very close, use lerp
+    if not isinstance(t, torch.Tensor):
+        t_tensor = torch.tensor(t, dtype=q0.dtype, device=q0.device)
+    else:
+        t_tensor = t
+
+    close = dot > 0.9995
+    q = torch.where(
+        close,
+        (1.0 - t_tensor) * q0 + t_tensor * q1,
+        torch.zeros_like(q0),
+    )
+
+    # SLERP for the rest
+    theta_0 = torch.acos(torch.clamp(dot, -1.0, 1.0))  # (...,1)
+    sin_theta_0 = torch.sin(theta_0).clamp_min(1e-8)
+    theta = theta_0 * t_tensor
+    sin_theta = torch.sin(theta)
+
+    s0 = torch.sin(theta_0 - theta) / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    q_slerp = s0 * q0 + s1 * q1
+
+    q = torch.where(close, q, q_slerp)
+    q = q / (q.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+    return q
+
+
+class QuatSlerpEmaFilter:
+    """
+    Filters per-joint rotations using SLERP-EMA in quaternion space.
+    - update only when valid=True
+    - hold-last when valid=False
+    """
+    def __init__(self, alpha: float = 0.2, warmup_frames: int = 0):
+        self.alpha = float(alpha)
+        self.warmup_frames = int(warmup_frames)
+        self._q_state = None  # (J,4)
+        self._valid_count = 0
+
+    @property
+    def has_state(self) -> bool:
+        return self._q_state is not None
+
+    def reset(self):
+        self._q_state = None
+        self._valid_count = 0
+
+    def get_rotmats(self) -> torch.Tensor:
+        if self._q_state is None:
+            raise RuntimeError("Filter has no state yet.")
+        return quat_to_rotmat(self._q_state)
+
+    def update(self, R: torch.Tensor, valid: bool = True) -> torch.Tensor:
+        """
+        R: (J,3,3)
+        returns filtered R_f: (J,3,3)
+        """
+        if (not valid):
+            # hold-last if we can
+            if self._q_state is not None:
+                return quat_to_rotmat(self._q_state)
+            return R
+
+        q = rotmat_to_quat(R)  # (J,4)
+
+        if self._q_state is None:
+            self._q_state = q
+            self._valid_count = 1
+            return R
+
+        # warmup: snap state to measurement to avoid initial lag
+        if self._valid_count < self.warmup_frames:
+            self._q_state = q
+            self._valid_count += 1
+            return R
+
+        # slerp-ema
+        self._q_state = quat_slerp(self._q_state, q, self.alpha)
+        self._valid_count += 1
+        return quat_to_rotmat(self._q_state)
+
 def parse_args():
     parser = argparse.ArgumentParser(description='show how to use SDK Python API')
 
@@ -149,6 +297,15 @@ def parse_args():
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--weights", required=True)
 
+    ##### smoothing op
+    parser.add_argument("--smooth", type=str, default="none",
+                        choices=["none", "ema_quat"],
+                        help="Smoothing applied at output of kpts2smpl (body_pose only).")
+    parser.add_argument("--ema-alpha", type=float, default=0.2,
+                        help="EMA strength for SLERP (0=no update, 1=no smoothing).")
+    parser.add_argument("--warmup-frames", type=int, default=0,
+                        help="Snap to measurements for first N valid frames (reduces initial lag).")
+    
     args = parser.parse_args()
     if args.video.isnumeric():
         args.video = int(args.video)
@@ -319,12 +476,10 @@ def main():
     ##### initialize 2D pose tracker
     tracker = PoseTracker(det_model=args.det_model, pose_model=args.pose_model, device_name=args.device_name)
     relevant_joint_idxs = sorted(set(i for pair in coco_wholebody["truncated_hand_skeleton_links"] for i in pair))
-
-    # optionally use OKS for keypoints similarity comparison
     sigmas  = VISUALIZATION_CFG[args.skeleton]['sigmas']
     state   = tracker.create_state(det_interval=15, det_min_bbox_size=50, keypoint_sigmas=sigmas)
 
-    ##### initialize 2D to 3D model
+    ##### initialize kpts2smpl
 
     # configs
     cfg         = load_hydra_cfg(args.config_path, args.config_name, args.override)
@@ -339,24 +494,8 @@ def main():
     smplx_helper.smplx_model = smplx_helper.smplx_model.to("cpu")
     faces       = smplx_helper.smplx_model.faces
     faces       = np.asarray(faces)    
-
-    """
-    N = 22
-    parents_full = smplx_helper.smplx_model.parents.detach().cpu().numpy().astype(int)
-    print("parents_full.shape:", parents_full.shape)
-
-    parents22 = parents_full[:N]
-    print("parents22:", parents22.tolist())
-    print("parents22 max:", parents22.max(), "min:", parents22.min())
-
-    bad = np.where(parents22 >= N)[0]
-    print("bad idx (parents>=N):", bad.tolist())
-    if len(bad) > 0:
-        print("bad parents values:", parents22[bad].tolist())
-    sys.exit()
-    """
     
-    # grab rest joints
+    # for manual fk computation
     with torch.inference_mode():
         I = torch.eye(3, dtype=torch.float32)
 
@@ -393,6 +532,7 @@ def main():
     t_start = time.time()
     frame_id = 0
 
+    # timer
     prof_sum = {
         "read_frame": 0.0,
         "pose2d": 0.0,
@@ -405,17 +545,26 @@ def main():
     }
     prof_n = 0
 
+    # we always set the global orientation to 0
     GLOBAL_ORIENT = torch.tensor([
                 [1., 0.,  0.],
                 [0., 0., -1.],
                 [0., 1.,  0.]
                 ], device="cpu")[None, None]
+    
+    # smoothing op
+    pose_filter = None
+    missing_streak = 0
+    if args.smooth == "ema_quat":
+        pose_filter = QuatSlerpEmaFilter(alpha=args.ema_alpha, warmup_frames=args.warmup_frames)
 
+    # for the 3d rendering function
     ref_center, ref_radius = None, None
 
     while True:
         t_total0 = time.perf_counter()
 
+        ##### read video
         t0 = time.perf_counter()
         success, frame = video.read()
         if not success or frame is None:
@@ -444,10 +593,13 @@ def main():
         ##### get 3d pose
         if args.pred_3d:
 
+            ##### preprocessing
             t0 = time.perf_counter()
             keypoints, bboxes, _ = results
 
             if keypoints is None or len(keypoints) == 0:
+                if pose_filter is not None:
+                    pose_filter.reset()
                 frame_id += 1
                 continue
 
@@ -461,12 +613,10 @@ def main():
             scores  = keypoints[0, relevant_joint_idxs, 2].astype(np.float32, copy=False)
             kpts[scores < 0.1] = 0.0
             kpts    = torch.from_numpy(kpts).unsqueeze(0)           # [k']
-
-            # mask placeholder input
             t1 = time.perf_counter()
             prof_sum["preprocess_2d"] += (t1 - t0)
                 
-            # forward pass
+            ##### kpts2smpl forward pass
             t0 = time.perf_counter()
             with torch.inference_mode():
                 out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
@@ -474,18 +624,20 @@ def main():
             t1 = time.perf_counter()
             prof_sum["mlp_forward"] += (t1 - t0)
 
+            ##### smooth
             t0 = time.perf_counter()
-            #global_orient   = pred_smpl[0:1]                    # [1,  6]
-            #global_orient   = rot6d_to_matrix(global_orient)    # [1,  3, 3]
-            #global_orient   = global_orient[None]               # [1, 1,  3, 3]
             global_orient = GLOBAL_ORIENT
             body_pose = pred_smpl[1:]                     # [21, 6]
             body_pose = rot6d_to_matrix(body_pose)        # [21, 3, 3]
+
+            if pose_filter is not None:
+                body_pose = pose_filter.update(body_pose, valid=True)
+
             body_pose = body_pose[None]                   # [1, 21, 3, 3]
             t1 = time.perf_counter()
             prof_sum["smpl_convert"] += (t1 - t0)
 
-            #################### form smplx model
+            ##### 3d skel visualization
             if args.show_3d_skel:
 
                 t0 = time.perf_counter()
@@ -502,6 +654,7 @@ def main():
                 if stick_vis is not None:
                     stick_vis.update(J_pos)
 
+            ##### 3d mesh visualization
             if args.show_3d_mesh:
                 
                 t0 = time.perf_counter()
@@ -535,10 +688,12 @@ def main():
                 t1 = time.perf_counter()
                 prof_sum["smpl_render"] += (t1 - t0)
 
+        ##### compute time taken for frame
         prof_sum["total_frame"] += (time.perf_counter() - t_total0)
         prof_n += 1
         frame_id += 1
 
+        ##### print timers
         if frame_id % 30 == 0:
             elapsed = time.time() - t_start
             fps = frame_id / elapsed
