@@ -3,10 +3,12 @@ import argparse
 import os
 import sys
 import time
+import torch
 
 import cv2
 import numpy as np
-import torch
+#import open3d as o3d
+
 from mmdeploy_runtime import PoseTracker
 from hydra import initialize_config_dir, compose
 
@@ -22,6 +24,52 @@ from dataset_util import rot6d_to_matrix
 
 sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/'))
 from utils_draw import render_simple_pyrender
+
+"""
+class StickFigureO3D:
+    def __init__(self, edges, window_name="SMPL Stick", width=800, height=800):
+        self.edges = np.asarray(edges, dtype=np.int32)
+
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window(window_name=window_name, width=width, height=height, visible=True)
+
+        self.lines = o3d.geometry.LineSet()
+        self.lines.lines = o3d.utility.Vector2iVector(self.edges)
+
+        n_pts = int(self.edges.max()) + 1 if len(self.edges) > 0 else 22
+        pts0 = np.zeros((n_pts, 3), dtype=np.float64)
+        self.lines.points = o3d.utility.Vector3dVector(pts0)
+
+        colors = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float64), (len(self.edges), 1))
+        self.lines.colors = o3d.utility.Vector3dVector(colors)
+
+        self.vis.add_geometry(self.lines)
+
+        opt = self.vis.get_render_option()
+        opt.background_color = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+        opt.line_width = 2.0
+
+        self._inited = False
+
+    def update(self, J_pos):
+        pts = np.asarray(J_pos, dtype=np.float64)
+
+        # optional: center on root for stable viewing
+        pts = pts - pts[0:1]
+
+        self.lines.points = o3d.utility.Vector3dVector(pts)
+        self.vis.update_geometry(self.lines)
+
+        if not self._inited:
+            self.vis.reset_view_point(True)
+            self._inited = True
+
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def close(self):
+        self.vis.destroy_window()
+"""
 
 def load_hydra_cfg(config_path, config_name, overrides):
     with initialize_config_dir(config_dir=config_path, version_base=None):
@@ -60,6 +108,25 @@ def build_kpts2smpl_model(cfg, weights_path, device="cpu"):
     print(f"[WEIGHTS] missing={len(missing)} unexpected={len(unexpected)}")
 
     return net
+
+def fk_joints_from_offsets(R, parents, J_OFF):
+    """
+    R: (22,3,3) rotation matrices
+    parents: (22,) int32 with parents[0] = -1
+    J_OFF: (22,3) rest offsets (root is absolute rest position)
+    returns: J_pos (22,3)
+    """
+    T = np.zeros((22, 4, 4), dtype=np.float32)
+    for j in range(22):
+        M = np.eye(4, dtype=np.float32)
+        M[:3, :3] = R[j]
+        M[:3, 3] = J_OFF[j]
+        p = parents[j]
+        if p == -1:
+            T[j] = M
+        else:
+            T[j] = T[p] @ M
+    return T[:, :3, 3]
 
 def parse_args():
     parser = argparse.ArgumentParser(description='show how to use SDK Python API')
@@ -272,6 +339,34 @@ def main():
     faces       = smplx_helper.smplx_model.faces
     faces       = np.asarray(faces)    
     
+    # grab rest joints
+    with torch.inference_mode():
+        zero = torch.zeros((1, 3), dtype=torch.float32)
+        zeros_body = torch.zeros((1, 21, 3, 3), dtype=torch.float32)
+
+        # NOTE: depends on your SMPLX library API; adjust if needed
+        out0 = smplx_helper.smplx_model(
+            transl=torch.zeros((1, 3)),
+            global_orient=torch.eye(3)[None, None],
+            body_pose=zeros_body,
+        )
+        J_rest = out0.joints[0].detach().cpu().numpy()[:22].astype(np.float32) # [22, 3]
+        parents = smplx_helper.smplx_model.parents[:22].detach().cpu().numpy().astype(np.int32) # [22]
+
+        J_OFF = np.zeros_like(J_rest, dtype=np.float32)
+        for j in range(22):
+            p = parents[j]
+            if p == -1:
+                J_OFF[j] = J_rest[j]
+            else:
+                J_OFF[j] = J_rest[j] - J_rest[p]
+
+        edges = [(int(p), j) for j, p in enumerate(parents) if int(p) != -1]
+        stick_vis = None
+        #if args.show_3d:
+        #    stick_vis = StickFigureO3D(edges, window_name="SMPL Stick", width=800, height=800)
+
+
     ##### begin 
 
     t_start = time.time()
@@ -284,6 +379,7 @@ def main():
         "mlp_forward": 0.0,
         "smpl_convert": 0.0,
         "smpl_render": 0.0,
+        "smpl_forward_pass": 0.0,
         "total_frame": 0.0,
     }
     prof_n = 0
@@ -293,6 +389,8 @@ def main():
                 [0., 0., -1.],
                 [0., 1.,  0.]
                 ], device="cpu")[None, None]
+
+    ref_center, ref_radius = None, None
 
     while True:
         t_total0 = time.perf_counter()
@@ -368,29 +466,53 @@ def main():
 
             #################### form smplx model
             if args.show_3d:
+
+                # t0 = time.perf_counter()
+                # R_root = global_orient[0, 0].detach().cpu().numpy().astype(np.float32)  # (3,3)
+                # R_body = body_pose[0].detach().cpu().numpy().astype(np.float32)         # (21,3,3)
+
+                # R       = np.zeros((22, 3, 3), dtype=np.float32)
+                # R[0]    = R_root
+                # R[1:]   = R_body
+                # J_pos = fk_joints_from_offsets(R, parents, J_OFF)
+                # t1 = time.perf_counter()
+                # prof_sum["smpl_forward_pass"] += (t1 - t0)
+
+                # if stick_vis is not None:
+                #     stick_vis.update(J_pos)
+                
+                t0 = time.perf_counter()
                 world_smplx_params = {
                     "transl": torch.zeros((1, 3), device="cpu", dtype=torch.float32),
                     "global_orient": global_orient.to(device="cpu", dtype=torch.float32),
                     "body_pose": body_pose.to(device="cpu", dtype=torch.float32),
                 }
                 world_posed_data    = smplx_helper.smplx_model(**world_smplx_params)
+                joints              = world_posed_data.joints[0,:22]
                 vertices            = world_posed_data.vertices[0]   # [10475, 3]
                 vertices            = vertices.detach().cpu().numpy()
+                t1 = time.perf_counter()
+                prof_sum["smpl_forward_pass"] += (t1 - t0)
+                #print(world_posed_data.joints.shape)
+                #sys.exit()
 
-                _, _, image = render_simple_pyrender(
+                t0 = time.perf_counter()
+                ref_center, ref_radius, image = render_simple_pyrender(
                     vertices,
                     faces,
                     "temp.png",
-                    img_width=800,
-                    img_height=800,
-                    ref_center=None,
-                    ref_radius=None,
-                    center_offset=(0.0, 0.0, 0.0),
-                    label="TRUE",
+                    img_width=300,
+                    img_height=300,
+                    ref_center=ref_center,
+                    ref_radius=ref_radius,
+                    views=((0, 0, 0),),
+                    label=None,
                     save=False,
                 )
                 cv2.imshow('smplx', image)
                 cv2.waitKey(1)
+                t1 = time.perf_counter()
+                prof_sum["smpl_render"] += (t1 - t0)
 
         prof_sum["total_frame"] += (time.perf_counter() - t_total0)
         prof_n += 1
@@ -409,7 +531,8 @@ def main():
                 f"pose2d={_ms(prof_sum['pose2d']/denom):.2f} | "
                 f"prep={_ms(prof_sum['preprocess_2d']/denom):.2f} | "
                 f"mlp={_ms(prof_sum['mlp_forward']/denom):.2f} | "
-                f"smpl={_ms(prof_sum['smpl_convert']/denom):.2f} | "
+                f"smpl_conv={_ms(prof_sum['smpl_convert']/denom):.2f} | "
+                f"smpl_forward={_ms(prof_sum['smpl_forward_pass']/denom):.2f} | "
                 f"render={_ms(prof_sum['smpl_render']/denom):.2f} | "
                 f"total={_ms(prof_sum['total_frame']/denom):.2f}"
             )
@@ -418,6 +541,9 @@ def main():
             for k in prof_sum:
                 prof_sum[k] = 0.0
             prof_n = 0
+
+    if stick_vis is not None:
+        stick_vis.close()
 
 if __name__ == '__main__':
     main()
