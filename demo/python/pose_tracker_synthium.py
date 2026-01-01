@@ -535,12 +535,11 @@ def main():
     # timer
     prof_sum = {
         "read_frame": 0.0,
-        "pose2d": 0.0,
-        "preprocess_2d": 0.0,
-        "mlp_forward": 0.0,
-        "smpl_convert": 0.0,
-        "smpl_render": 0.0,
-        "smpl_forward_pass": 0.0,
+        "img2pose": 0.0,
+        "visualize_2d_pose": 0.0,
+        "kpts2smpl": 0.0,
+        "visualize_3d_skel": 0.0,
+        "visualize_3d_mesh": 0.0,
         "total_frame": 0.0,
     }
     prof_n = 0
@@ -577,17 +576,23 @@ def main():
         t0 = time.perf_counter()
         results = tracker(state, frame, detect=-1)
         t1 = time.perf_counter()
-        prof_sum["pose2d"] += (t1 - t0)
+        prof_sum["img2pose"] += (t1 - t0)
 
         ##### visualize 2d pose
         if args.save_2d or args.show_2d:
-            if not visualize(
+            t0 = time.perf_counter()
+            ok = visualize(
                     frame,
                     results,
                     frame_id,
                     skeleton_type=args.skeleton,
                     save_vis=args.save_2d,
-                    show_vis=args.show_2d):
+                    show_vis=args.show_2d
+                )
+            t1 = time.perf_counter()
+            prof_sum["visualize_2d_pose"] += (t1 - t0)
+            
+            if not ok:
                 break
 
         ##### get 3d pose
@@ -613,19 +618,13 @@ def main():
             scores  = keypoints[0, relevant_joint_idxs, 2].astype(np.float32, copy=False)
             kpts[scores < 0.1] = 0.0
             kpts    = torch.from_numpy(kpts).unsqueeze(0)           # [k']
-            t1 = time.perf_counter()
-            prof_sum["preprocess_2d"] += (t1 - t0)
                 
             ##### kpts2smpl forward pass
-            t0 = time.perf_counter()
             with torch.inference_mode():
                 out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
             pred_smpl = out["pred_smpl"][0]  # [22,6]
-            t1 = time.perf_counter()
-            prof_sum["mlp_forward"] += (t1 - t0)
 
             ##### smooth
-            t0 = time.perf_counter()
             global_orient = GLOBAL_ORIENT
             body_pose = pred_smpl[1:]                     # [21, 6]
             body_pose = rot6d_to_matrix(body_pose)        # [21, 3, 3]
@@ -635,7 +634,7 @@ def main():
 
             body_pose = body_pose[None]                   # [1, 21, 3, 3]
             t1 = time.perf_counter()
-            prof_sum["smpl_convert"] += (t1 - t0)
+            prof_sum["kpts2smpl"] += (t1 - t0)
 
             ##### 3d skel visualization
             if args.show_3d_skel:
@@ -648,11 +647,11 @@ def main():
                 R[0]    = R_root
                 R[1:]   = R_body
                 J_pos = fk_joints_from_offsets(R, parents, J_OFF)
-                t1 = time.perf_counter()
-                prof_sum["smpl_forward_pass"] += (t1 - t0)
 
                 if stick_vis is not None:
                     stick_vis.update(J_pos)
+                t1 = time.perf_counter()
+                prof_sum["visualize_3d_skel"] += (t1 - t0)
 
             ##### 3d mesh visualization
             if args.show_3d_mesh:
@@ -667,9 +666,7 @@ def main():
                 joints              = world_posed_data.joints[0,:22]
                 vertices            = world_posed_data.vertices[0]   # [10475, 3]
                 vertices            = vertices.detach().cpu().numpy()
-                t1 = time.perf_counter()
-                prof_sum["smpl_forward_pass"] += (t1 - t0)
-
+                
                 t0 = time.perf_counter()
                 ref_center, ref_radius, image = render_simple_pyrender(
                     vertices,
@@ -686,7 +683,7 @@ def main():
                 cv2.imshow('smplx', image)
                 cv2.waitKey(1)
                 t1 = time.perf_counter()
-                prof_sum["smpl_render"] += (t1 - t0)
+                prof_sum["visualize_3d_mesh"] += (t1 - t0)
 
         ##### compute time taken for frame
         prof_sum["total_frame"] += (time.perf_counter() - t_total0)
@@ -704,12 +701,11 @@ def main():
             print(
                 "[TIMING ms/frame] "
                 f"read={_ms(prof_sum['read_frame']/denom):.2f} | "
-                f"pose2d={_ms(prof_sum['pose2d']/denom):.2f} | "
-                f"prep={_ms(prof_sum['preprocess_2d']/denom):.2f} | "
-                f"mlp={_ms(prof_sum['mlp_forward']/denom):.2f} | "
-                f"smpl_conv={_ms(prof_sum['smpl_convert']/denom):.2f} | "
-                f"smpl_forward={_ms(prof_sum['smpl_forward_pass']/denom):.2f} | "
-                f"render={_ms(prof_sum['smpl_render']/denom):.2f} | "
+                f"img2pose={_ms(prof_sum['img2pose']/denom):.2f} | "
+                f"visualize_2d_pose={_ms(prof_sum['visualize_2d_pose']/denom):.2f} | "
+                f"kpts2smpl={_ms(prof_sum['kpts2smpl']/denom):.2f} | "
+                f"visualize_3d_skel={_ms(prof_sum['visualize_3d_skel']/denom):.2f} | "
+                f"visualize_3d_mesh={_ms(prof_sum['visualize_3d_mesh']/denom):.2f} | "
                 f"total={_ms(prof_sum['total_frame']/denom):.2f}"
             )
 
