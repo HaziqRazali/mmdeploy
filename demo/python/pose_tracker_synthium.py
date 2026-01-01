@@ -289,7 +289,7 @@ def parse_args():
     parser.add_argument("--pred-3d", type=int, default=1)
     parser.add_argument("--show-3d-skel", type=int, default=0, help="Show skel visualization window")
     parser.add_argument("--show-3d-mesh", type=int, default=0, help="Show mesh window")
-    parser.add_argument('--skeleton', default='coco', choices=['coco', 'coco_wholebody', 'coco_wholebody_truncated_hand'], help='skeleton for keypoints')
+    parser.add_argument('--skeleton', default='coco', choices=['coco', 'coco_wholebody', 'whole_body_skeleton'], help='skeleton for keypoints')
 
     ##### 2D to 3D model arguments    
     parser.add_argument("--config-path", required=True)
@@ -382,8 +382,8 @@ VISUALIZATION_CFG = dict(
             0.026, 0.025, 0.024, 0.035, 0.018, 0.024, 0.022, 0.026, 0.017,
             0.021, 0.021, 0.032, 0.02, 0.019, 0.022, 0.031
         ]))
-VISUALIZATION_CFG["coco_wholebody_truncated_hand"] = dict(
-    skeleton=coco_wholebody["truncated_hand_skeleton_links"],
+VISUALIZATION_CFG["whole_body_skeleton"] = dict(
+    skeleton=coco_wholebody["whole_body_skeleton_links"],
 
     # reuse palette from coco_wholebody
     palette=VISUALIZATION_CFG["coco_wholebody"]["palette"],
@@ -475,7 +475,7 @@ def main():
 
     ##### initialize 2D pose tracker
     tracker = PoseTracker(det_model=args.det_model, pose_model=args.pose_model, device_name=args.device_name)
-    relevant_joint_idxs = sorted(set(i for pair in coco_wholebody["truncated_hand_skeleton_links"] for i in pair))
+    relevant_joint_idxs = sorted(set(i for pair in coco_wholebody["whole_body_skeleton_links"] for i in pair))
     sigmas  = VISUALIZATION_CFG[args.skeleton]['sigmas']
     state   = tracker.create_state(det_interval=15, det_min_bbox_size=50, keypoint_sigmas=sigmas)
 
