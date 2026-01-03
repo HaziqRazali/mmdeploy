@@ -14,7 +14,7 @@ from hydra import initialize_config_dir, compose
 
 sys.path.append(os.path.join(os.path.expanduser("~"), "Collab_AI"))
 sys.path.append(os.path.join(os.path.expanduser("~"), "Collab_AI", "dataloaders", "variables"))
-from fit3d_variables import coco_wholebody
+from fit3d_variables import coco_wholebody, smplx_mask
 
 sys.path.append(os.path.expanduser('~/datasets/mocap/my_scripts/imar_vision_datasets_tools/'))
 from util.smplx_util import SMPLXHelper
@@ -152,7 +152,6 @@ def rotmat_to_quat(R: torch.Tensor) -> torch.Tensor:
     q = q / (q.norm(dim=-1, keepdim=True).clamp_min(1e-8))
     return q
 
-
 def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
     """
     q: (..., 4) as (w, x, y, z), assumed normalized
@@ -182,7 +181,6 @@ def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
         dim=-1,
     ).reshape(q.shape[:-1] + (3, 3))
     return R
-
 
 def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
     """
@@ -220,7 +218,6 @@ def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
     q = torch.where(close, q, q_slerp)
     q = q / (q.norm(dim=-1, keepdim=True).clamp_min(1e-8))
     return q
-
 
 class QuatSlerpEmaFilter:
     """
@@ -298,13 +295,9 @@ def parse_args():
     parser.add_argument("--weights", required=True)
 
     ##### smoothing op
-    parser.add_argument("--smooth", type=str, default="none",
-                        choices=["none", "ema_quat"],
-                        help="Smoothing applied at output of kpts2smpl (body_pose only).")
-    parser.add_argument("--ema-alpha", type=float, default=0.2,
-                        help="EMA strength for SLERP (0=no update, 1=no smoothing).")
-    parser.add_argument("--warmup-frames", type=int, default=0,
-                        help="Snap to measurements for first N valid frames (reduces initial lag).")
+    parser.add_argument("--smooth", type=str, default="none", choices=["none", "ema_quat"], help="Smoothing applied at output of kpts2smpl (body_pose only).")
+    parser.add_argument("--ema-alpha", type=float, default=0.2, help="EMA strength for SLERP (0=no update, 1=no smoothing).")
+    parser.add_argument("--warmup-frames", type=int, default=0, help="Snap to measurements for first N valid frames (reduces initial lag).")
     
     args = parser.parse_args()
     if args.video.isnumeric():
@@ -315,10 +308,9 @@ def parse_args():
 
     return args
 
-#print(coco_wholebody["truncated_hand_skeleton_links"])
-#sys.exit()
-
 VISUALIZATION_CFG = dict(
+
+    # default coco config
     coco=dict(
         skeleton=[(15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11),
                   (6, 12), (5, 6), (5, 7), (6, 8), (7, 9), (8, 10), (1, 2),
@@ -337,6 +329,8 @@ VISUALIZATION_CFG = dict(
             0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072, 0.072,
             0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089
         ]),
+
+    # default coco wholebody config
     coco_wholebody=dict(
         skeleton=[(15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11),
                   (6, 12), (5, 6), (5, 7), (6, 8), (7, 9), (8, 10), (1, 2),
@@ -382,44 +376,18 @@ VISUALIZATION_CFG = dict(
             0.026, 0.025, 0.024, 0.035, 0.018, 0.024, 0.022, 0.026, 0.017,
             0.021, 0.021, 0.032, 0.02, 0.019, 0.022, 0.031
         ]))
-VISUALIZATION_CFG["whole_body_skeleton"] = dict(
-    skeleton=coco_wholebody["whole_body_skeleton_links"],
 
-    # reuse palette from coco_wholebody
-    palette=VISUALIZATION_CFG["coco_wholebody"]["palette"],
+def make_vis_cfg_from_base(skeleton_links, base_key="coco_wholebody", link_color=None, point_color=None):
+    base = VISUALIZATION_CFG[base_key]
+    return dict(
+        skeleton=skeleton_links,
+        palette=base["palette"],
+        link_color=base["link_color"] if link_color is None else link_color,
+        point_color=base["point_color"] if point_color is None else point_color,
+        sigmas=base["sigmas"],  # keep identical for OKS/tracking
+    )
 
-    # link_color: one entry per link
-    # strategy:
-    #   body links → normal colors
-    #   left truncated hand → color 4
-    #   right truncated hand → color 5
-    link_color=(
-        # body + upper body (first 25 links)
-        VISUALIZATION_CFG["coco_wholebody"]["link_color"][:25]
-        +
-        # left truncated hand (3 links)
-        [4, 4, 4]
-        +
-        # right truncated hand (3 links)
-        [5, 5, 5]
-    ),
-
-    # start from wholebody point colors
-    point_color=list(VISUALIZATION_CFG["coco_wholebody"]["point_color"]),
-
-    # IMPORTANT: keep sigmas identical so tracking / OKS stays correct
-    sigmas=VISUALIZATION_CFG["coco_wholebody"]["sigmas"],
-)
-
-def visualize(frame,
-              results,
-              frame_id,
-              skeleton_type='coco',
-              save_vis=None,
-              show_vis=False,
-              thr=0.5,
-              resize=400,
-              ):
+def visualize(frame, results, frame_id, skeleton_type='coco', save_vis=None, show_vis=False, thr=0.5, resize=400):
 
     skeleton    = VISUALIZATION_CFG[skeleton_type]['skeleton']
     palette     = VISUALIZATION_CFG[skeleton_type]['palette']
@@ -465,29 +433,33 @@ def visualize(frame,
 
     return True
 
-
 def main():
     args = parse_args()
     np.set_printoptions(precision=4, suppress=True)
+
+    ##### read config
+    cfg         = load_hydra_cfg(args.config_path, args.config_name, args.override)
+    input_key   = "kpts_normalized_filtered"
+    kpts_config = cfg.dataset_settings.kpts_config
     
     ##### initialize video capture
     video   = cv2.VideoCapture(args.video)
 
     ##### initialize 2D pose tracker
     tracker = PoseTracker(det_model=args.det_model, pose_model=args.pose_model, device_name=args.device_name)
-    relevant_joint_idxs = sorted(set(i for pair in coco_wholebody["whole_body_skeleton_links"] for i in pair))
-    sigmas  = VISUALIZATION_CFG[args.skeleton]['sigmas']
+    VISUALIZATION_CFG[kpts_config] = make_vis_cfg_from_base(coco_wholebody[kpts_config+"_skeleton_links"])
+    sigmas  = VISUALIZATION_CFG[kpts_config]['sigmas']
     state   = tracker.create_state(det_interval=15, det_min_bbox_size=50, keypoint_sigmas=sigmas)
 
     ##### initialize kpts2smpl
-
-    # configs
-    cfg         = load_hydra_cfg(args.config_path, args.config_name, args.override)
-    input_key   = "kpts_normalized_filtered"
-
     # build net
     net = build_kpts2smpl_model(cfg, args.weights).float()
     mask = torch.ones((1, 22, 1), device="cpu", dtype=torch.float32)
+    mask[0,0] = 0
+    mask[0,smplx_mask[kpts_config+"_mask"]] = 0
+
+    # this defines the joints the net takes as input
+    relevant_joint_idxs = sorted(set(i for pair in coco_wholebody[kpts_config+"_skeleton_links"] for i in pair))
 
     # initialize smpl
     smplx_helper = SMPLXHelper(os.path.expanduser('~/datasets/mocap/data/models_smplx_v1_1/models/'))
@@ -545,11 +517,8 @@ def main():
     prof_n = 0
 
     # we always set the global orientation to 0
-    GLOBAL_ORIENT = torch.tensor([
-                [1., 0.,  0.],
-                [0., 0., -1.],
-                [0., 1.,  0.]
-                ], device="cpu")[None, None]
+    rot6d_G = torch.tensor([1., 0., 0., 0., 0., 1.], device="cpu", dtype=torch.float32)
+    rot6d_I = torch.tensor([1., 0., 0., 0., 1., 0.], device="cpu", dtype=torch.float32)
     
     # smoothing op
     pose_filter = None
@@ -585,7 +554,7 @@ def main():
                     frame,
                     results,
                     frame_id,
-                    skeleton_type=args.skeleton,
+                    skeleton_type=kpts_config,
                     save_vis=args.save_2d,
                     show_vis=args.show_2d
                 )
@@ -622,12 +591,17 @@ def main():
             ##### kpts2smpl forward pass
             with torch.inference_mode():
                 out = net({"kpts_normalized_filtered": kpts, "mask": mask}, mode="val")
-            pred_smpl = out["pred_smpl"][0]  # [22,6]
+                pred_smpl = out["pred_smpl"][0]                         # [22, 6]
+
+                # overwrite joints with identity
+                pred_smpl[0] = rot6d_G                                  # [22, 6]
+                pred_smpl[smplx_mask[kpts_config + "_mask"]] = rot6d_I  # [22, 6]
 
             ##### smooth
-            global_orient = GLOBAL_ORIENT
-            body_pose = pred_smpl[1:]                     # [21, 6]
-            body_pose = rot6d_to_matrix(body_pose)        # [21, 3, 3]
+            global_orient = pred_smpl[0:1]                  # [1, 6]
+            global_orient = rot6d_to_matrix(global_orient)  # [1, 3, 3]
+            body_pose = pred_smpl[1:]                       # [21, 6]
+            body_pose = rot6d_to_matrix(body_pose)          # [21, 3, 3]
 
             if pose_filter is not None:
                 body_pose = pose_filter.update(body_pose, valid=True)
@@ -640,8 +614,8 @@ def main():
             if args.show_3d_skel:
 
                 t0 = time.perf_counter()
-                R_root = global_orient[0, 0].detach().cpu().numpy().astype(np.float32)  # (3,3)
-                R_body = body_pose[0].detach().cpu().numpy().astype(np.float32)         # (21,3,3)
+                R_root = global_orient.detach().cpu().numpy().astype(np.float32)  # (3,3)
+                R_body = body_pose[0].detach().cpu().numpy().astype(np.float32)   # (21,3,3)
 
                 R       = np.zeros((22, 3, 3), dtype=np.float32)
                 R[0]    = R_root
@@ -659,7 +633,7 @@ def main():
                 t0 = time.perf_counter()
                 world_smplx_params = {
                     "transl": torch.zeros((1, 3), device="cpu", dtype=torch.float32),
-                    "global_orient": global_orient.to(device="cpu", dtype=torch.float32),
+                    "global_orient": global_orient[None].to(device="cpu", dtype=torch.float32),
                     "body_pose": body_pose.to(device="cpu", dtype=torch.float32),
                 }
                 world_posed_data    = smplx_helper.smplx_model(**world_smplx_params)
